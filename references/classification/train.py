@@ -24,6 +24,7 @@ except ImportError:
     amp = None
 
 T_co = TypeVar('T_co', covariant=True)
+# test comment
 
 class CustomDistributedSampler(DistributedSampler):
     """
