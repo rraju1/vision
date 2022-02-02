@@ -1,14 +1,20 @@
 from __future__ import print_function
 import datetime
+from email.policy import default
 import os
 import time
 import sys
+from typing import List, Optional, Iterator, TypeVar
+import math
+import numpy as np
 
 import torch
 import torch.utils.data
 from torch import nn
 import torchvision
 from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader, SubsetRandomSampler, DistributedSampler
+from torchvision.datasets.folder import default_loader
 
 import utils
 
@@ -16,6 +22,93 @@ try:
     from apex import amp
 except ImportError:
     amp = None
+
+T_co = TypeVar('T_co', covariant=True)
+
+class CustomDistributedSampler(DistributedSampler):
+    """
+    Wrapper function in order to apporpriate load the correct subsets of data and distribute that across devices (expects SubSetRandomSampler)
+    """
+    def __init__(self, sampler: SubsetRandomSampler, \
+                       dataset: Dataset, \
+                       num_replicas: Optional[int] = None, \
+                       rank: Optional[int] = None, \
+                       shuffle: bool = True, \
+                       seed: int = 0, \
+                       drop_last: bool = False) -> None:
+        super().__init__(dataset, num_replicas, rank, shuffle, seed, drop_last)
+        self.sampler = sampler
+        self.num_samples = math.ceil(len(self.sampler.indices) / self.num_replicas)
+        self.total_size = self.num_samples * self.num_replicas
+    
+    def __iter__(self) -> Iterator[T_co]:
+        if self.shuffle:
+            # deterministically shuffle based on epoch and seed
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            self.sampler.generator = g
+            indices = list(self.sampler.__iter__())
+        else:
+            indices = self.sampler.indices
+        
+        if not self.drop_last:
+            padding_size = self.total_size - len(indices)
+            if padding_size <= len(indices):
+                indices += indices[:padding_size]
+            else:
+                indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
+        else:
+            indices = indices[:self.total_size]
+        assert len(indices) == self.total_size
+
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        assert len(indices) == self.num_samples
+
+        return iter(indices)
+
+    def __len__(self) -> int:
+        return len(self.sampler.indices)
+
+def updateLoaderIndices(dataloader: DataLoader, new_indices: List):
+    dataloader.sampler.sampler.indices = new_indices
+    dataloader.sampler.num_samples = math.ceil(len(dataloader.sampler.sampler.indices) / dataloader.sampler.num_replicas)
+    dataloader.sampler.total_size = dataloader.sampler.num_samples * dataloader.sampler.num_replicas
+
+
+class ImageNetDataset(Dataset):
+    def __init__(self, img_path, annotation_file, loader, idx=True, transform=None, target_transform=None):
+        self.samples = self.readImgsAndLabels(annotation_file)
+        self.img_path = img_path
+        self.loader = loader
+        self.transform = transform
+        self.target_transform = target_transform
+        self.idx = idx
+
+    def readImgsAndLabels(self, annotation_file):
+        f = open(annotation_file)
+        str_list = []
+        for item in f:
+            img_file_name, label_id = item.rstrip().split()
+            str_list.append([img_file_name, int(label_id)]) 
+        f.close()
+        return str_list
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        img_filename, target = self.samples[index]
+        target = target - 1 # need to put labels in range [0,999] from [1,1000]
+        total_imgpath = os.path.join(self.img_path, img_filename)
+        sample = self.loader(total_imgpath)
+        if self.transform is not None:
+            sample = self.transform(sample)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+        if self.idx:
+            return sample, target, index
+        return sample, target
+
 
 
 def train_one_epoch(model, criterion, optimizer, data_loader, device, epoch, print_freq, apex=False):
@@ -81,7 +174,7 @@ def _get_cache_path(filepath):
     return cache_path
 
 
-def load_data(traindir, valdir, cache_dataset, distributed):
+def load_data(traindir, valdir, train_annotation, val_annotation, cache_dataset, distributed):
     # Data loading code
     print("Loading data")
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -95,14 +188,20 @@ def load_data(traindir, valdir, cache_dataset, distributed):
         print("Loading dataset_train from {}".format(cache_path))
         dataset, _ = torch.load(cache_path)
     else:
-        dataset = torchvision.datasets.ImageFolder(
-            traindir,
-            transforms.Compose([
+        # dataset = torchvision.datasets.ImageFolder(
+        #     traindir,
+            # transforms.Compose([
+            #     transforms.RandomResizedCrop(224),
+            #     transforms.RandomHorizontalFlip(),
+            #     transforms.ToTensor(),
+            #     normalize,
+            # ]))
+        transform = transforms.Compose([
                 transforms.RandomResizedCrop(224),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                normalize,
-            ]))
+                normalize])
+        dataset = ImageNetDataset(traindir, train_annotation, default_loader, False, transform)
         if cache_dataset:
             print("Saving dataset_train to {}".format(cache_path))
             utils.mkdir(os.path.dirname(cache_path))
@@ -116,14 +215,20 @@ def load_data(traindir, valdir, cache_dataset, distributed):
         print("Loading dataset_test from {}".format(cache_path))
         dataset_test, _ = torch.load(cache_path)
     else:
-        dataset_test = torchvision.datasets.ImageFolder(
-            valdir,
-            transforms.Compose([
+        test_transform = transforms.Compose([
                 transforms.Resize(256),
                 transforms.CenterCrop(224),
                 transforms.ToTensor(),
-                normalize,
-            ]))
+                normalize])
+        # dataset_test = torchvision.datasets.ImageFolder(
+        #     valdir,
+        #     transforms.Compose([
+        #         transforms.Resize(256),
+        #         transforms.CenterCrop(224),
+        #         transforms.ToTensor(),
+        #         normalize,
+        #     ]))
+        dataset_test = ImageNetDataset(valdir, val_annotation, default_loader, False, test_transform)
         if cache_dataset:
             print("Saving dataset_test to {}".format(cache_path))
             utils.mkdir(os.path.dirname(cache_path))
@@ -160,15 +265,31 @@ def main(args):
 
     train_dir = os.path.join(args.data_path, 'train')
     val_dir = os.path.join(args.data_path, 'val')
-    dataset, dataset_test, train_sampler, test_sampler = load_data(train_dir, val_dir,
-                                                                   args.cache_dataset, args.distributed)
-    data_loader = torch.utils.data.DataLoader(
-        dataset, batch_size=args.batch_size,
-        sampler=train_sampler, num_workers=args.workers, pin_memory=True)
+    train_annotation = os.path.join(args.annotation_path, 'train.txt')
+    val_annotation = os.path.join(args.annotation_path, 'val.txt')
+    dataset, dataset_test, train_sampler, test_sampler = load_data(train_dir, val_dir, train_annotation,
+                                                                   val_annotation ,args.cache_dataset, args.distributed)
 
-    data_loader_test = torch.utils.data.DataLoader(
-        dataset_test, batch_size=args.batch_size,
-        sampler=test_sampler, num_workers=args.workers, pin_memory=True)
+
+    if args.distributed:
+        train_sampler = SubsetRandomSampler(np.arange(dataset.__len__())) # change this when needed
+        cus_train_dist_sampler = CustomDistributedSampler(train_sampler, dataset, shuffle=False)
+        val_sampler = SubsetRandomSampler(np.arange(dataset_test.__len__())) # change this when needed
+        cus_val_dist_sampler = CustomDistributedSampler(val_sampler, dataset_test, shuffle=False)
+        data_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=args.batch_size,
+            sampler=cus_train_dist_sampler, num_workers=args.workers, pin_memory=True)
+        data_loader_test = torch.utils.data.DataLoader(
+            dataset_test, batch_size=args.batch_size,
+            sampler=cus_val_dist_sampler, num_workers=args.workers, pin_memory=True)
+    else:
+        data_loader = torch.utils.data.DataLoader(
+            dataset, batch_size=args.batch_size,
+            sampler=train_sampler, num_workers=args.workers, pin_memory=True)
+
+        data_loader_test = torch.utils.data.DataLoader(
+            dataset_test, batch_size=args.batch_size,
+            sampler=test_sampler, num_workers=args.workers, pin_memory=True)
 
     print("Creating model")
     model = torchvision.models.__dict__[args.model](pretrained=args.pretrained)
@@ -235,7 +356,8 @@ def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description='PyTorch Classification Training')
 
-    parser.add_argument('--data-path', default='/datasets01/imagenet_full_size/061417/', help='dataset')
+    parser.add_argument('--data-path', default='/group/ece/ececompeng/lipasti/libraries/datasets/ILSVRC/Data/CLS-LOC/', help='dataset')
+    parser.add_argument('--annotation-path', default='/group/ece/ececompeng/lipasti/libraries/datasets/ILSVRC/', help='annotation')
     parser.add_argument('--model', default='resnet18', help='model')
     parser.add_argument('--device', default='cuda', help='device')
     parser.add_argument('-b', '--batch-size', default=32, type=int)
@@ -260,7 +382,7 @@ def parse_args():
         "--cache-dataset",
         dest="cache_dataset",
         help="Cache the datasets for quicker initialization. It also serializes the transforms",
-        action="store_true",
+        action="store_false",
     )
     parser.add_argument(
         "--sync-bn",
