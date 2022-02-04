@@ -90,7 +90,9 @@ class ImageNetDataset(Dataset):
         str_list = []
         for item in f:
             img_file_name, label_id = item.rstrip().split()
-            str_list.append([img_file_name, int(label_id)]) 
+            label_id = int(label_id)
+            label_id = label_id - 1
+            str_list.append([img_file_name, label_id]) 
         f.close()
         return str_list
 
@@ -99,7 +101,7 @@ class ImageNetDataset(Dataset):
 
     def __getitem__(self, index):
         img_filename, target = self.samples[index]
-        target = target - 1 # need to put labels in range [0,999] from [1,1000]
+        # target = target # need to put labels in range [0,999] from [1,1000]
         total_imgpath = os.path.join(self.img_path, img_filename)
         sample = self.loader(total_imgpath)
         if self.transform is not None:
@@ -189,20 +191,20 @@ def load_data(traindir, valdir, train_annotation, val_annotation, cache_dataset,
         print("Loading dataset_train from {}".format(cache_path))
         dataset, _ = torch.load(cache_path)
     else:
-        # dataset = torchvision.datasets.ImageFolder(
-        #     traindir,
-            # transforms.Compose([
-            #     transforms.RandomResizedCrop(224),
-            #     transforms.RandomHorizontalFlip(),
-            #     transforms.ToTensor(),
-            #     normalize,
-            # ]))
-        transform = transforms.Compose([
+        dataset = torchvision.datasets.ImageFolder(
+            traindir,
+            transforms.Compose([
                 transforms.RandomResizedCrop(224),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
-                normalize])
-        dataset = ImageNetDataset(traindir, train_annotation, default_loader, False, transform)
+                normalize,
+            ]))
+        # transform = transforms.Compose([
+        #         transforms.RandomResizedCrop(224),
+        #         transforms.RandomHorizontalFlip(),
+        #         transforms.ToTensor(),
+        #         normalize])
+        # dataset = ImageNetDataset(traindir, train_annotation, default_loader, False, transform)
         if cache_dataset:
             print("Saving dataset_train to {}".format(cache_path))
             utils.mkdir(os.path.dirname(cache_path))
@@ -216,20 +218,20 @@ def load_data(traindir, valdir, train_annotation, val_annotation, cache_dataset,
         print("Loading dataset_test from {}".format(cache_path))
         dataset_test, _ = torch.load(cache_path)
     else:
-        test_transform = transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
-                transforms.ToTensor(),
-                normalize])
-        # dataset_test = torchvision.datasets.ImageFolder(
-        #     valdir,
-        #     transforms.Compose([
+        # test_transform = transforms.Compose([
         #         transforms.Resize(256),
         #         transforms.CenterCrop(224),
         #         transforms.ToTensor(),
-        #         normalize,
-        #     ]))
-        dataset_test = ImageNetDataset(valdir, val_annotation, default_loader, False, test_transform)
+        #         normalize])
+        dataset_test = torchvision.datasets.ImageFolder(
+            valdir,
+            transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                normalize,
+            ]))
+        # dataset_test = ImageNetDataset(valdir, val_annotation, default_loader, False, test_transform)
         if cache_dataset:
             print("Saving dataset_test to {}".format(cache_path))
             utils.mkdir(os.path.dirname(cache_path))
@@ -259,13 +261,16 @@ def main(args):
 
     utils.init_distributed_mode(args)
     print(args)
+    
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     device = torch.device(args.device)
 
     torch.backends.cudnn.benchmark = True
 
     train_dir = os.path.join(args.data_path, 'train')
-    val_dir = os.path.join(args.data_path, 'val')
+    val_dir = os.path.join(args.data_path, 'ravi_val')
     train_annotation = os.path.join(args.annotation_path, 'train.txt')
     val_annotation = os.path.join(args.annotation_path, 'val.txt')
     dataset, dataset_test, train_sampler, test_sampler = load_data(train_dir, val_dir, train_annotation,
@@ -274,9 +279,9 @@ def main(args):
 
     if args.distributed:
         train_sampler = SubsetRandomSampler(np.arange(dataset.__len__())) # change this when needed
-        cus_train_dist_sampler = CustomDistributedSampler(train_sampler, dataset, shuffle=False)
+        cus_train_dist_sampler = CustomDistributedSampler(train_sampler, dataset, shuffle=False, seed=args.seed)
         val_sampler = SubsetRandomSampler(np.arange(dataset_test.__len__())) # change this when needed
-        cus_val_dist_sampler = CustomDistributedSampler(val_sampler, dataset_test, shuffle=False)
+        cus_val_dist_sampler = CustomDistributedSampler(val_sampler, dataset_test, shuffle=False, seed=args.seed)
         data_loader = torch.utils.data.DataLoader(
             dataset, batch_size=args.batch_size,
             sampler=cus_train_dist_sampler, num_workers=args.workers, pin_memory=True)
@@ -379,11 +384,12 @@ def parse_args():
     parser.add_argument('--resume', default='', help='resume from checkpoint')
     parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                         help='start epoch')
+    parser.add_argument('--seed', default=0, type=int, help="set random seed to control randomness")
     parser.add_argument(
         "--cache-dataset",
         dest="cache_dataset",
         help="Cache the datasets for quicker initialization. It also serializes the transforms",
-        action="store_false",
+        action="store_true",
     )
     parser.add_argument(
         "--sync-bn",
